@@ -1,0 +1,228 @@
+{
+  "info": {
+    "name": "ZeaCares Disease Surveillance API",
+    "description": "Complete test collection for ZeaCares NLP pipeline API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "base_url", "value": "http://127.0.0.1:8000" }
+  ],
+  "item": [
+    {
+      "name": "System",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Classification",
+      "item": [
+        {
+          "name": "Classify - Hypertension (lookup fast path)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Female 60 years, presented with hypertension stage 2. Onset was gradual with duration of 3 day(s). Severity: mild. Vitals: Temperature 98F, Pulse 72bpm, BP 110/80mmHg, SpO2 98%. BMI status: Healthy. Attended UPHC Lankapatnam.\",\n  \"district\": \"Vizianagaram\",\n  \"record_id\": \"TEST-001\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify - Diabetes",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Female 51 years, presented with diabetic on oral treatment. Onset was gradual with duration of 3 day(s). Severity: mild. Vitals: Temperature 98F, Pulse 72bpm, BP 110/80mmHg, SpO2 98%. BMI status: Healthy. Attended UPHC Lankapatnam.\",\n  \"district\": \"Vizianagaram\",\n  \"record_id\": \"TEST-002\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify - Fever",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Male 35 years, presented with fever. Onset was sudden with duration of 2 day(s). Severity: moderate. Vitals: Temperature 101F, Pulse 88bpm, BP 120/80mmHg, SpO2 97%. BMI status: Normal. Attended PHC Kurnool.\",\n  \"district\": \"Kurnool\",\n  \"record_id\": \"TEST-003\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify - Dog Bite (Zoonotic)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Male 45 years, presented with dog bite. Onset was sudden with duration of 1 day(s). Severity: moderate. Vitals: Temperature 98F, Pulse 80bpm, BP 125/82mmHg, SpO2 98%. BMI status: Normal. Attended CHC Guntur.\",\n  \"district\": \"Guntur\",\n  \"record_id\": \"TEST-004\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify - Loose Motion (Diarrheal)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Male 8 years, presented with loose motion. Onset was sudden with duration of 1 day(s). Severity: moderate. Vitals: Temperature 99F, Pulse 95bpm, BP 100/65mmHg, SpO2 98%. BMI status: Normal. Attended PHC Srikakulam.\",\n  \"district\": \"Srikakulam\",\n  \"record_id\": \"TEST-005\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify - Ambiguous (triggers LLM fallback)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"clinical_text\": \"Female 32 years, presented with painful swollen joints bilateral with morning stiffness lasting more than 1 hour. Onset was gradual with duration of 14 day(s). Severity: moderate. Vitals: Temperature 99.2F, Pulse 82bpm, BP 118/76mmHg, SpO2 99%. BMI status: Normal. Attended District Hospital Visakhapatnam.\",\n  \"district\": \"Visakhapatnam\",\n  \"record_id\": \"TEST-006\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Classify Batch (file upload)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/classify/batch",
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "/Users/shubham/Downloads/zeacares_upload_ready.csv.xlsx",
+                  "description": "XLSX or CSV with clinicalText and district columns"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Surveillance",
+      "item": [
+        {
+          "name": "Trends - East Godavari (All diseases)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/trends/East Godavari?days=30",
+              "host": ["{{base_url}}"],
+              "path": ["trends", "East Godavari"],
+              "query": [{ "key": "days", "value": "30" }]
+            }
+          }
+        },
+        {
+          "name": "Trends - Vizianagaram (Communicable only)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/trends/Vizianagaram?disease_category=Communicable&days=30",
+              "host": ["{{base_url}}"],
+              "path": ["trends", "Vizianagaram"],
+              "query": [
+                { "key": "disease_category", "value": "Communicable" },
+                { "key": "days", "value": "30" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Trends - Krishna (Non-Communicable, 60 days)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{base_url}}/trends/Krishna?disease_category=Non-Communicable&days=60",
+              "host": ["{{base_url}}"],
+              "path": ["trends", "Krishna"],
+              "query": [
+                { "key": "disease_category", "value": "Non-Communicable" },
+                { "key": "days", "value": "60" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Active Alerts",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/alerts/active"
+          }
+        },
+        {
+          "name": "Refresh Alerts (background trigger)",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/alerts/refresh"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dashboard",
+      "item": [
+        {
+          "name": "Statewide Summary",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/dashboard/summary"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Model Improvement",
+      "item": [
+        {
+          "name": "Submit Feedback - Rheumatoid Arthritis correction",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/feedback",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"record_id\": \"TEST-006\",\n  \"original_icd10_code\": \"R69\",\n  \"corrected_icd10_code\": \"M06.9\",\n  \"corrected_description\": \"Rheumatoid arthritis, unspecified\",\n  \"corrected_category\": \"Non-Communicable\",\n  \"officer_id\": \"DR-VSKP-042\",\n  \"notes\": \"Morning stiffness >1hr with bilateral joint involvement is classic RA pattern\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Submit Feedback - Fever corrected to Dengue",
+          "request": {
+            "method": "POST",
+            "url": "{{base_url}}/feedback",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"record_id\": \"TEST-003\",\n  \"original_icd10_code\": \"R50.9\",\n  \"corrected_icd10_code\": \"A90\",\n  \"corrected_description\": \"Dengue fever\",\n  \"corrected_category\": \"Communicable\",\n  \"officer_id\": \"DR-KNL-018\",\n  \"notes\": \"Platelet drop + rash confirmed dengue on lab followup\"\n}"
+            }
+          }
+        },
+        {
+          "name": "Feedback Stats",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/feedback/stats"
+          }
+        }
+      ]
+    }
+  ]
+}

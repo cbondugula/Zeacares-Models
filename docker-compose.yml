@@ -1,0 +1,109 @@
+version: "3.9"
+
+services:
+  # ── Main API Service ──────────────────────────────────────────────────────────
+  zeacares-api:
+    build: .
+    container_name: zeacares-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://zeacares:zeacares_password@zeacares-postgres:5432/zeacares
+      - REDIS_URL=redis://zeacares-redis:6379
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - MODEL_CACHE_DIR=/app/model_cache
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./results:/app/results
+      - model_cache:/app/model_cache
+    depends_on:
+      zeacares-postgres:
+        condition: service_healthy
+      zeacares-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - zeacares-net
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  # ── PostgreSQL Database ───────────────────────────────────────────────────────
+  zeacares-postgres:
+    image: postgis/postgis:16-3.4
+    container_name: zeacares-postgres
+    environment:
+      - POSTGRES_USER=zeacares
+      - POSTGRES_PASSWORD=zeacares_password
+      - POSTGRES_DB=zeacares
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zeacares -d zeacares"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - zeacares-net
+
+  # ── Redis Cache ───────────────────────────────────────────────────────────────
+  zeacares-redis:
+    image: redis:7-alpine
+    container_name: zeacares-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - zeacares-net
+
+  # ── Background Worker (batch processing + trend detection) ────────────────────
+  zeacares-worker:
+    build: .
+    container_name: zeacares-worker
+    command: >
+      python -c "
+      import time, logging
+      from src.pipeline.trend_detector import TrendDetector
+      from pathlib import Path
+      logging.basicConfig(level=logging.INFO)
+      logger = logging.getLogger('worker')
+      detector = TrendDetector()
+      while True:
+          classified = Path('results/classified.json')
+          if classified.exists():
+              logger.info('Running trend detection...')
+              detector.run(str(classified), 'results/alerts.json')
+          time.sleep(3600)  # Re-run every hour
+      "
+    environment:
+      - DATABASE_URL=postgresql://zeacares:zeacares_password@zeacares-postgres:5432/zeacares
+      - REDIS_URL=redis://zeacares-redis:6379
+    volumes:
+      - ./results:/app/results
+      - model_cache:/app/model_cache
+    depends_on:
+      - zeacares-api
+    restart: unless-stopped
+    networks:
+      - zeacares-net
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+
+networks:
+  zeacares-net:
+    driver: bridge

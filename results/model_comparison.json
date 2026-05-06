@@ -1,0 +1,29 @@
+[
+  {
+    "model_name": "BIOBERT",
+    "avg_inference_ms": 40.77658414840698,
+    "icd10_accuracy": 51.9,
+    "category_accuracy": 79.2,
+    "top3_accuracy": 80.5,
+    "f1_score": 0.627,
+    "coverage_pct": 77.0
+  },
+  {
+    "model_name": "CLINICALBERT",
+    "avg_inference_ms": 37.75247573852539,
+    "icd10_accuracy": 66.2,
+    "category_accuracy": 84.4,
+    "top3_accuracy": 87.0,
+    "f1_score": 0.742,
+    "coverage_pct": 77.0
+  },
+  {
+    "model_name": "PUBMEDBERT",
+    "avg_inference_ms": 54.67418909072876,
+    "icd10_accuracy": 85.7,
+    "category_accuracy": 87.0,
+    "top3_accuracy": 87.0,
+    "f1_score": 0.864,
+    "coverage_pct": 77.0
+  }
+]
