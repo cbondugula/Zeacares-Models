@@ -60,6 +60,7 @@ class ClassificationResponse(BaseModel):
     bp_diastolic: Optional[int]
     spo2_pct: Optional[float]
     bmi_status: Optional[str]
+    facility: Optional[str]
 
 
 class BatchClassificationResponse(BaseModel):

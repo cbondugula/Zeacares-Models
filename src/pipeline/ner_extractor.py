@@ -94,7 +94,7 @@ _NORMALIZE_MAP = {
     # Communicable
     r"dog\s+bite":                                     "dog bite",
     r"dengue\s+(hemorrhagic\s+)?fever":               "dengue fever",
-    r"\bdengue\b":                                     "dengue fever",
+    r"\bdengue\b(?!\s+fever)":                        "dengue fever",
     r"malarial\s+fever":                               "malaria",
     r"\bmalaria\b":                                    "malaria",
     r"typhoid\s*(fever)?":                             "typhoid",
@@ -120,8 +120,8 @@ _NORMALIZE_MAP = {
     r"\burticaria\b|\bhives\b":                        "allergy",
     r"skin\s+infection|infected\s+wound":              "skin infection",
     # Other NCD
-    r"iron\s+deficiency\s+an[ae]mia":                 "anemia",
-    r"\ban[ae]mia\b":                                  "anemia",
+    r"iron\s+deficiency\s+an[ae]{1,2}mia":             "anemia",
+    r"\ban[ae]{1,2}mia\b":                            "anemia",
     r"hypothyroid(ism)?":                              "hypothyroidism",
     r"hyperthyroid(ism)?":                             "hyperthyroidism",
     r"chest\s+pain":                                   "chest pain",

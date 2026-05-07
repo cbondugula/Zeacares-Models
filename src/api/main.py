@@ -9,13 +9,19 @@ import logging
 import os
 import tempfile
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, File, HTTPException, UploadFile, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.collection import Collection
 
 from src.api.schemas import (
     ActiveAlertsResponse,
@@ -32,28 +38,48 @@ from src.api.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Global classifier instance (loaded once at startup)
-_classifier = None
+# ── Globals ───────────────────────────────────────────────────────────────────
+_classifier   = None
 _trend_detector = None
+_mongo_client = None
+_db           = None
 
 RESULTS_DIR = Path("results")
 RESULTS_DIR.mkdir(exist_ok=True)
 
 
+def get_col(name: str) -> Collection:
+    return _db[name]
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _classifier, _trend_detector
-    logger.info("Loading ZeaCares classifier...")
+    global _classifier, _trend_detector, _mongo_client, _db
+
+    # ── MongoDB ───────────────────────────────────────────────────────────────
+    mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+    _mongo_client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+    _db = _mongo_client["zeacares"]
+    # Indexes for fast queries
+    _db["classifications"].create_index([("district", ASCENDING), ("disease_category", ASCENDING)])
+    _db["classifications"].create_index([("record_id", ASCENDING)])
+    _db["classifications"].create_index([("created_at", DESCENDING)])
+    logger.info("MongoDB connected → zeacares")
+
+    # ── Classifier (loads ClinicalBERT once) ──────────────────────────────────
+    logger.info("Loading ZeaCares classifier (ClinicalBERT)...")
     from src.pipeline.classifier import ZeaCaresClassifier
     from src.pipeline.trend_detector import TrendDetector
-
     _classifier = ZeaCaresClassifier(
-        openrouter_api_key=os.getenv("OPENROUTER_API_KEY"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
         device=os.getenv("DEVICE"),
     )
+    _classifier._init()   # pre-load model at startup — not per request
     _trend_detector = TrendDetector()
     logger.info("ZeaCares API ready")
     yield
+
+    _mongo_client.close()
     logger.info("Shutting down ZeaCares API")
 
 
@@ -81,11 +107,17 @@ app.add_middleware(
 
 @app.get("/health", response_model=HealthCheckResponse, tags=["System"])
 async def health_check():
+    db_ok = False
+    try:
+        _mongo_client.admin.command("ping")
+        db_ok = True
+    except Exception:
+        pass
     return HealthCheckResponse(
         status="healthy",
         version="1.0.0",
-        models_loaded=_classifier is not None,
-        database_connected=True,
+        models_loaded=_classifier is not None and _classifier._initialized,
+        database_connected=db_ok,
         timestamp=datetime.utcnow().isoformat() + "Z",
     )
 
@@ -94,20 +126,20 @@ async def health_check():
 
 @app.post("/classify", response_model=ClassificationResponse, tags=["Classification"])
 async def classify_single(request: ClassifyRequest):
-    """
-    Classify a single clinical text record.
-    Returns ICD-10 code, disease category, confidence, and review flag.
-    Processing time: ~200ms (lookup/embedding) to ~3s (LLM fallback).
-    """
+    """Classify a single clinical text record and store result in MongoDB."""
     if not _classifier:
         raise HTTPException(status_code=503, detail="Classifier not initialized")
-
     try:
         result = _classifier.classify(
             clinical_text=request.clinical_text,
             district=request.district,
             record_id=request.record_id or "api_call",
         )
+        doc = asdict(result)
+        doc["created_at"] = datetime.utcnow()
+        doc["source"] = "api"
+        get_col("classifications").insert_one(doc)
+        doc.pop("_id", None)
         return ClassificationResponse(**result.__dict__)
     except Exception as e:
         logger.error(f"Classification failed: {e}")
@@ -119,20 +151,17 @@ async def classify_batch(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="CSV or XLSX file with clinicalText, district columns"),
 ):
-    """
-    Process a batch CSV/XLSX file. Returns immediately with a job ID.
-    Results are saved to results/classified_{timestamp}.json.
-    """
+    """Process a batch file. Results stored in MongoDB + results/ folder."""
     if not _classifier:
         raise HTTPException(status_code=503, detail="Classifier not initialized")
-
     if not file.filename.endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=400, detail="Only .csv and .xlsx files accepted")
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     output_path = str(RESULTS_DIR / f"classified_{timestamp}.json")
+    # Always overwrite classified.json so trend/dashboard endpoints find it
+    canonical_path = str(RESULTS_DIR / "classified.json")
 
-    # Save uploaded file
     suffix = ".xlsx" if file.filename.endswith(".xlsx") else ".csv"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         content = await file.read()
@@ -141,7 +170,24 @@ async def classify_batch(
 
     def _run_batch():
         try:
-            _classifier.classify_batch(tmp_path, output_path)
+            results = _classifier.classify_batch(tmp_path, output_path)
+            # Also write canonical path for trend/dashboard
+            import shutil
+            shutil.copy(output_path, canonical_path)
+            # Store all results in MongoDB
+            if results:
+                docs = []
+                for r in results:
+                    doc = asdict(r)
+                    doc["created_at"] = datetime.utcnow()
+                    doc["source"] = "batch"
+                    doc["batch_file"] = file.filename
+                    doc["batch_ts"] = timestamp
+                    docs.append(doc)
+                get_col("classifications").insert_many(docs)
+                logger.info(f"Stored {len(docs)} records in MongoDB zeacares.classifications")
+        except Exception as e:
+            logger.error(f"Batch failed: {e}")
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -166,156 +212,134 @@ async def get_trends(
     disease_category: Optional[str] = Query(default=None),
     days: int = Query(default=30, ge=7, le=365),
 ):
-    """
-    Get disease trend data for a specific AP district.
-    Returns daily case counts with CUSUM scores for outbreak monitoring.
-    """
-    classified_path = RESULTS_DIR / "classified.json"
-    if not classified_path.exists():
-        raise HTTPException(status_code=404,
-                            detail="No classified records found. Run /classify/batch first.")
+    """Get disease trend data from MongoDB for a specific AP district."""
+    import pandas as pd
+
+    query: dict = {"district": district}
+    if disease_category:
+        query["disease_category"] = disease_category
+
+    count = get_col("classifications").count_documents(query)
+    if count == 0:
+        raise HTTPException(status_code=404, detail=f"No records found for district: {district}")
+
+    cursor = get_col("classifications").find(query, {"_id": 0})
+    df = pd.DataFrame(list(cursor))
+
+    if "created_at" not in df.columns:
+        df["created_at"] = datetime.utcnow()
+    df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
+
+    series = df.groupby("date").size().rename("case_count")
+    full_range = pd.date_range(series.index.min(), series.index.max(), freq="D")
+    series = series.reindex(full_range, fill_value=0)
+
     try:
-        df = _trend_detector.load_classified_records(str(classified_path))
-        df = df[df["district"] == district]
-        if df.empty:
-            raise HTTPException(status_code=404, detail=f"No records found for district: {district}")
-
-        if disease_category:
-            df = df[df["disease_category"] == disease_category]
-
-        agg = _trend_detector.aggregate_daily(df)
-        group = agg[agg["district"] == district]
-        if disease_category:
-            group = group[group["disease_category"] == disease_category]
-
-        import pandas as pd
-        full_range = pd.date_range(
-            group["date"].min(),
-            group["date"].max(),
-            freq="D"
-        )
-        series = (
-            group.groupby("date")["case_count"]
-            .sum()
-            .reindex(full_range, fill_value=0)
-        )
         cusum_scores, _ = _trend_detector.cusum.fit_predict(series)
         _, prophet_anomaly = _trend_detector.prophet.detect_anomalies(series)
+    except Exception:
+        cusum_scores, prophet_anomaly = {}, {}
 
-        data_points = [
-            TrendDataPoint(
-                date=str(d.date()),
-                case_count=int(v),
-                cusum_score=round(float(cusum_scores.get(d, 0.0)), 2),
-                is_anomaly=bool(prophet_anomaly.get(d, False)),
-            )
-            for d, v in series.items()
-        ]
-
-        return TrendResponse(
-            district=district,
-            disease_category=disease_category or "All",
-            date_range=f"{series.index.min().date()} to {series.index.max().date()}",
-            total_cases=int(series.sum()),
-            daily_avg=round(float(series.mean()), 1),
-            peak_day=str(series.idxmax().date()) if len(series) > 0 else None,
-            peak_count=int(series.max()),
-            data_points=data_points,
-            has_alert=any(dp.is_anomaly or dp.cusum_score > 5 for dp in data_points[-7:]),
+    data_points = [
+        TrendDataPoint(
+            date=str(d.date()),
+            case_count=int(v),
+            cusum_score=round(float(cusum_scores.get(d, 0.0)), 2),
+            is_anomaly=bool(prophet_anomaly.get(d, False)),
         )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Trend query failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        for d, v in series.items()
+    ]
+
+    return TrendResponse(
+        district=district,
+        disease_category=disease_category or "All",
+        date_range=f"{series.index.min().date()} to {series.index.max().date()}",
+        total_cases=int(series.sum()),
+        daily_avg=round(float(series.mean()), 1),
+        peak_day=str(series.idxmax().date()) if len(series) > 0 else None,
+        peak_count=int(series.max()),
+        data_points=data_points,
+        has_alert=any(dp.is_anomaly or dp.cusum_score > 5 for dp in data_points[-7:]),
+    )
 
 
 # ── Alerts ─────────────────────────────────────────────────────────────────────
 
 @app.get("/alerts/active", response_model=ActiveAlertsResponse, tags=["Surveillance"])
 async def get_active_alerts():
-    """
-    Get all currently active outbreak alerts across AP.
-    Sorted by severity: CRITICAL → HIGH → MEDIUM → LOW.
-    """
-    alerts_path = RESULTS_DIR / "alerts.json"
-    if not alerts_path.exists():
-        return ActiveAlertsResponse(
-            total_alerts=0, critical=0, high=0, medium=0, low=0,
-            alerts=[], generated_at=datetime.utcnow().isoformat() + "Z",
-        )
-
-    with open(alerts_path) as f:
-        data = json.load(f)
-
-    alerts = [AlertResponse(**a) for a in data.get("alerts", [])]
-    severity_counts = {s: 0 for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
-    for a in alerts:
-        severity_counts[a.alert_severity] = severity_counts.get(a.alert_severity, 0) + 1
-
+    """Get active outbreak alerts from MongoDB."""
+    alerts = list(get_col("alerts").find({}, {"_id": 0}).sort("triggered_at", DESCENDING))
+    severity_counts = {s: sum(1 for a in alerts if a.get("alert_severity") == s)
+                       for s in ("CRITICAL", "HIGH", "MEDIUM", "LOW")}
     return ActiveAlertsResponse(
         total_alerts=len(alerts),
         critical=severity_counts["CRITICAL"],
         high=severity_counts["HIGH"],
         medium=severity_counts["MEDIUM"],
         low=severity_counts["LOW"],
-        alerts=alerts,
-        generated_at=data.get("generated_at", datetime.utcnow().isoformat() + "Z"),
+        alerts=[AlertResponse(**a) for a in alerts],
+        generated_at=datetime.utcnow().isoformat() + "Z",
     )
 
 
 @app.post("/alerts/refresh", tags=["Surveillance"])
 async def refresh_alerts(background_tasks: BackgroundTasks):
-    """Trigger a background re-run of trend detection and update alerts.json."""
-    classified_path = RESULTS_DIR / "classified.json"
-    if not classified_path.exists():
-        raise HTTPException(status_code=404, detail="No classified records found")
+    """Trigger alert re-detection from MongoDB data."""
+    count = get_col("classifications").count_documents({})
+    if count == 0:
+        raise HTTPException(status_code=404, detail="No classified records in database")
 
     def _run():
-        _trend_detector.run(str(classified_path), str(RESULTS_DIR / "alerts.json"))
+        classified_path = RESULTS_DIR / "classified.json"
+        alerts_path = RESULTS_DIR / "alerts.json"
+        if classified_path.exists():
+            _trend_detector.run(str(classified_path), str(alerts_path))
+            if alerts_path.exists():
+                with open(alerts_path) as f:
+                    data = json.load(f)
+                alerts = data.get("alerts", [])
+                if alerts:
+                    get_col("alerts").delete_many({})
+                    for a in alerts:
+                        a["refreshed_at"] = datetime.utcnow()
+                    get_col("alerts").insert_many(alerts)
+                    logger.info(f"Stored {len(alerts)} alerts in MongoDB")
 
     background_tasks.add_task(_run)
-    return {"status": "refreshing", "message": "Alert refresh started in background"}
+    return {"status": "refreshing", "message": "Alert refresh started"}
 
 
 # ── Dashboard ──────────────────────────────────────────────────────────────────
 
 @app.get("/dashboard/summary", response_model=DashboardSummary, tags=["Dashboard"])
 async def dashboard_summary():
-    """
-    Statewide summary statistics for the main dashboard.
-    Returns: total records, active alerts, district coverage, top diseases.
-    """
-    classified_path = RESULTS_DIR / "classified.json"
-    if not classified_path.exists():
-        raise HTTPException(status_code=404, detail="No classified records found")
-
-    with open(classified_path) as f:
-        records = json.load(f)
-
+    """Statewide summary from MongoDB."""
     import pandas as pd
-    df = pd.DataFrame(records)
+
+    count = get_col("classifications").count_documents({})
+    if count == 0:
+        raise HTTPException(status_code=404, detail="No classified records found. Run /classify/batch first.")
+
+    cursor = get_col("classifications").find({}, {"_id": 0,
+        "created_at": 1, "disease_raw": 1, "disease_category": 1, "district": 1})
+    df = pd.DataFrame(list(cursor))
 
     now = datetime.utcnow()
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-        records_7d = int(df[df["date"] >= now - pd.Timedelta(days=7)].shape[0])
-        records_30d = int(df[df["date"] >= now - pd.Timedelta(days=30)].shape[0])
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"])
+        records_7d  = int(df[df["created_at"] >= now - pd.Timedelta(days=7)].shape[0])
+        records_30d = int(df[df["created_at"] >= now - pd.Timedelta(days=30)].shape[0])
     else:
-        records_7d = len(records)
-        records_30d = len(records)
+        records_7d = records_30d = count
 
     top_diseases = (
         df["disease_raw"].value_counts().head(10)
-        .reset_index().rename(columns={"index": "disease", "disease_raw": "count"})
+        .reset_index()
+        .rename(columns={"disease_raw": "disease", "count": "count"})
         .to_dict("records")
     )
 
-    alerts_path = RESULTS_DIR / "alerts.json"
-    active_alerts = 0
-    if alerts_path.exists():
-        with open(alerts_path) as f:
-            active_alerts = json.load(f).get("total_alerts", 0)
+    active_alerts = get_col("alerts").count_documents({})
 
     return DashboardSummary(
         total_records_7d=records_7d,
@@ -329,50 +353,29 @@ async def dashboard_summary():
     )
 
 
-# ── Feedback / Model Improvement Loop ─────────────────────────────────────────
+# ── Feedback ───────────────────────────────────────────────────────────────────
 
 @app.post("/feedback", tags=["Improvement"])
 async def submit_feedback(request: FeedbackRequest):
-    """
-    Medical officer submits ICD code correction for a misclassified record.
-    Corrections are stored and used for weekly ClinicalBERT fine-tuning.
-    """
-    feedback_path = RESULTS_DIR / "feedback.json"
-    existing = []
-    if feedback_path.exists():
-        with open(feedback_path) as f:
-            existing = json.load(f)
-
-    existing.append({
-        **request.model_dump(),
-        "submitted_at": datetime.utcnow().isoformat() + "Z",
-    })
-
-    with open(feedback_path, "w") as f:
-        json.dump(existing, f, indent=2)
-
+    """Store ICD correction in MongoDB for model fine-tuning."""
+    doc = {**request.model_dump(), "submitted_at": datetime.utcnow()}
+    get_col("feedback").insert_one(doc)
+    total = get_col("feedback").count_documents({})
     return {
         "status": "accepted",
-        "total_feedback_records": len(existing),
+        "total_feedback_records": total,
         "message": "Correction recorded. Will be included in next model fine-tuning cycle.",
     }
 
 
 @app.get("/feedback/stats", tags=["Improvement"])
 async def feedback_stats():
-    """Summary of collected corrections for fine-tuning readiness."""
-    feedback_path = RESULTS_DIR / "feedback.json"
-    if not feedback_path.exists():
-        return {"total": 0, "ready_for_finetuning": False, "threshold": 50}
-
-    with open(feedback_path) as f:
-        records = json.load(f)
-
+    total = get_col("feedback").count_documents({})
     return {
-        "total": len(records),
-        "ready_for_finetuning": len(records) >= 50,
+        "total": total,
+        "ready_for_finetuning": total >= 50,
         "threshold": 50,
-        "message": f"{len(records)}/50 corrections collected for next fine-tuning cycle",
+        "message": f"{total}/50 corrections collected for next fine-tuning cycle",
     }
 
 

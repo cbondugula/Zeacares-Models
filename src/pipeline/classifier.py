@@ -50,6 +50,7 @@ class ClassificationOutput:
     bp_diastolic: Optional[int] = None
     spo2_pct: Optional[float] = None
     bmi_status: Optional[str] = None
+    facility: Optional[str] = None
 
 
 class ZeaCaresClassifier:
@@ -64,10 +65,10 @@ class ZeaCaresClassifier:
     5. Flag for review if LLM confidence < threshold
     """
 
-    def __init__(self, openrouter_api_key: Optional[str] = None,
+    def __init__(self, openai_api_key: Optional[str] = None,
                  device: Optional[str] = None,
                  model_cache_dir: str = "model_cache"):
-        self.api_key = openrouter_api_key or os.getenv("OPENROUTER_API_KEY")
+        self.api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
         self.device = device
         self.model_cache_dir = model_cache_dir
         self._ner = None
@@ -83,17 +84,18 @@ class ZeaCaresClassifier:
 
         from src.pipeline.ner_extractor import NERExtractor
         from src.data.icd10_mapper import ICD10Mapper
-        from src.models.pubmedbert_classifier import PubMedBERTClassifier
+        from src.models.clinicalbert_classifier import ClinicalBERTClassifier
         from src.models.model_comparator import ICD10_ANCHORS
 
         self._ner = NERExtractor(use_model=False)
         self._icd_mapper = ICD10Mapper()
-        # PubMedBERT wins raw embedding accuracy: 85.7% vs ClinicalBERT 66.2%
-        self._embedding_model = PubMedBERTClassifier(device=self.device)
+        # ClinicalBERT wins on expanded anchors: 86.2% vs PubMedBERT 62.5%
+        # Trained on MIMIC-III — closest to AP PHC clinical note style
+        self._embedding_model = ClinicalBERTClassifier(device=self.device)
         self._icd_anchors = ICD10_ANCHORS
         self._build_faiss_index()
         self._initialized = True
-        logger.info("ZeaCaresClassifier initialized with PubMedBERT embedding")
+        logger.info("ZeaCaresClassifier initialized with ClinicalBERT embedding")
 
     def _build_faiss_index(self) -> None:
         try:
@@ -114,57 +116,183 @@ class ZeaCaresClassifier:
             results = self._embedding_model.embed_batch(anchor_texts)
             self._anchor_vectors = np.array([r.embedding for r in results], dtype=np.float32)
 
-    def _embedding_search(self, disease_text: str, top_k: int = 3) -> tuple[str, str, str, str, float]:
+    def _embedding_search(self, disease_text: str, entity=None,
+                          top_k: int = 10) -> tuple[str, str, str, str, float]:
         """
-        Search ICD-10 anchors by embedding similarity.
-        Returns top-k candidates then re-ranks using category consistency.
+        Search ICD-10 anchors by ClinicalBERT cosine similarity then apply
+        context-aware re-ranking using extracted entity signals.
+        top_k=5 gives the re-ranker enough candidates (top-3 acc is 96.2%).
         Returns (code, desc, category, sub_category, score).
         """
         emb_result = self._embedding_model.embed(disease_text)
         query = emb_result.embedding.reshape(1, -1).astype(np.float32)
 
+        # Score all anchors so keyword boosts always fire regardless of FAISS rank.
+        # With 47 anchors this is negligible overhead (~0.1ms).
         if self._faiss_index is not None:
             import faiss
-            scores, indices = self._faiss_index.search(query, top_k)
+            n_anchors = len(self._icd_anchors)
+            scores, indices = self._faiss_index.search(query, n_anchors)
             top_scores = [float(s) for s in scores[0]]
             top_indices = [int(i) for i in indices[0]]
         else:
             from sklearn.metrics.pairwise import cosine_similarity
             sims = cosine_similarity(query, self._anchor_vectors)[0]
-            top_indices = list(np.argsort(sims)[-top_k:][::-1])
+            top_indices = list(range(len(self._icd_anchors)))
             top_scores = [float(sims[i]) for i in top_indices]
 
-        best_idx = top_indices[0]
-        best_score = top_scores[0]
+        # ── Context-aware re-ranking ──────────────────────────────────────────
+        scored = []
+        for idx, base_score in zip(top_indices, top_scores):
+            code, desc, cat, subcat = self._icd_anchors[idx]
+            ctx = base_score
 
-        # Re-ranking: if top-2 and top-3 score within 5% of top-1,
-        # prefer the candidate whose ICD chapter is more common in our data.
-        # Priority order for AP PHC data: NCD > Symptom NOS > Communicable > Injury
-        chapter_priority = {"Non-Communicable": 3, "Symptom NOS": 2,
-                            "Communicable": 1, "Injury": 0}
-        if len(top_indices) > 1 and top_scores[0] > 0:
-            gap = top_scores[0] - top_scores[1]
-            if gap < 0.05:  # within 5% — re-rank by chapter priority
-                candidates = list(zip(top_indices, top_scores))
-                candidates.sort(
-                    key=lambda x: (top_scores[0] - x[1] < 0.05,
-                                   chapter_priority.get(self._icd_anchors[x[0]][2], 0)),
-                    reverse=True,
-                )
-                best_idx, best_score = candidates[0]
+            if entity is not None:
+                age = entity.age or 0
+                onset = (entity.onset or "").lower()
+                duration = entity.duration_days or 0
+                temp = entity.temp_f or 0.0
 
+                # NCDs dominate in adults 40+ (AP PHC data: 60%+ NCD)
+                if age >= 40 and cat == "Non-Communicable":
+                    ctx += 0.025
+                # Fever + sudden onset → communicable
+                if temp >= 99.5 and onset == "sudden" and cat == "Communicable":
+                    ctx += 0.020
+                # Gradual onset → NCD (hypertension, diabetes, etc.)
+                if onset == "gradual" and cat == "Non-Communicable":
+                    ctx += 0.015
+                # Chronic duration (>7d) → NCD or chronic communicable
+                if duration >= 7 and cat == "Non-Communicable":
+                    ctx += 0.010
+                # Acute 1-2d + sudden → communicable / symptom
+                if duration <= 2 and onset == "sudden" and cat in ("Communicable", "Symptom NOS"):
+                    ctx += 0.010
+                # Sub-category keyword boosts — fix Symptom NOS bleed-over
+                disease_lower = (entity.disease_raw or "").lower()
+                _kw_subcat = {
+                    "joint":    ("Musculoskeletal", 0.040),
+                    "back":     ("Musculoskeletal", 0.030),
+                    "neck":     ("Musculoskeletal", 0.030),
+                    "knee":     ("Musculoskeletal", 0.035),
+                    "hip":      ("Musculoskeletal", 0.030),
+                    "shoulder": ("Musculoskeletal", 0.030),
+                    "throat":   ("Respiratory",     0.040),
+                    "cold":     ("Respiratory",     0.030),
+                    "cough":    ("Respiratory",     0.025),
+                    "diarrhea": ("Diarrheal",       0.040),
+                    "loose":    ("Diarrheal",       0.035),
+                    "dengue":   ("Vector-borne",    0.050),
+                    "malaria":  ("Vector-borne",    0.050),
+                    "typhoid":  ("Enteric",         0.050),
+                    "urin":     ("Urological",      0.040),
+                    "diabet":   ("Metabolic",       0.040),
+                    "hypertens":("Cardiovascular",  0.040),
+                    "htn":      ("Cardiovascular",  0.035),
+                    "anemi":    ("Hematological",   0.040),
+                    "anaemi":   ("Hematological",   0.040),
+                    "seizure":  ("Neurological",    0.040),
+                    "epilep":   ("Neurological",    0.040),
+                    "thyroid":  ("Endocrine",       0.040),
+                    "skin":     ("Dermatological",  0.025),
+                    "eye":      ("Ocular",          0.030),
+                    "ear":      ("ENT",             0.030),
+                }
+                for kw, (target_subcat, boost) in _kw_subcat.items():
+                    if kw in disease_lower and subcat == target_subcat:
+                        ctx += boost
+
+                # Code-level boost — fixes within-category ICD disambiguation
+                _code_boost = {
+                    "throat pain":     ("J02.9",   0.075),
+                    "sore throat":     ("J02.9",   0.075),
+                    "throat":          ("J02.9",   0.055),
+                    "feverish cold":   ("J06.9",   0.075),
+                    "common cold":     ("J06.9",   0.070),
+                    "running nose":    ("J06.9",   0.065),
+                    "asthma":          ("J45.909", 0.075),
+                    "pneumonia":       ("J18.9",   0.075),
+                    "bronchitis":      ("J40",     0.075),
+                    "tuberculosis":    ("A15.9",   0.080),
+                    "viral fever":     ("B34.9",   0.075),
+                    "loose motion":    ("A09",     0.075),
+                    "diarrhea":        ("A09",     0.075),
+                    "loose stool":     ("A09",     0.070),
+                    "vomiting":        ("R11.10",  0.065),
+                    "nausea":          ("R11.10",  0.060),
+                    "gas pain":        ("R14.0",   0.070),
+                    "gastric reflux":  ("K21.0",   0.070),
+                    "constipation":    ("K59.00",  0.070),
+                    "joint pain":      ("M25.50",  0.120),
+                    "arthralgia":      ("M25.50",  0.120),
+                    "arthritis":       ("M25.50",  0.120),
+                    "backache":        ("M54.5",   0.120),
+                    "back pain":       ("M54.5",   0.120),
+                    "whole body pain": ("M79.3",   0.100),
+                    "whole body":      ("M79.3",   0.090),
+                    "myalgia":         ("M79.10",  0.100),
+                    "body ache":       ("M79.10",  0.090),
+                    "neck pain":       ("M54.2",   0.120),
+                    "cervical":        ("M54.2",   0.100),
+                    "knee pain":       ("M25.50",  0.110),
+                    "hip pain":        ("M25.50",  0.110),
+                    "shoulder pain":   ("M25.50",  0.110),
+                    "headache":        ("R51.9",   0.070),
+                    "giddiness":       ("R42",     0.075),
+                    "vertigo":         ("R42",     0.075),
+                    "seizure":         ("G40.909", 0.080),
+                    "epilepsy":        ("G40.909", 0.080),
+                    "fits":            ("G40.909", 0.070),
+                    "depression":      ("F32.9",   0.075),
+                    "hypertension":    ("I10",     0.075),
+                    "chest pain":      ("R07.9",   0.070),
+                    "diabetic":        ("E11.9",   0.075),
+                    "diabetes":        ("E11.9",   0.075),
+                    "hypothyroid":     ("E03.9",   0.075),
+                    "anemia":          ("D64.9",   0.075),
+                    "anaemia":         ("D64.9",   0.075),
+                    "dengue":          ("A90",     0.085),
+                    "malaria":         ("B54",     0.085),
+                    "malarial":        ("B54",     0.080),
+                    "typhoid":         ("A01.00",  0.085),
+                    "chickenpox":      ("B01.9",   0.085),
+                    "chicken pox":     ("B01.9",   0.080),
+                    "hepatitis":       ("B19.9",   0.080),
+                    "dog bite":        ("W54.0",   0.085),
+                    "urinary tract":   ("N39.0",   0.080),
+                    "burning urin":    ("N39.0",   0.075),
+                    "dysuria":         ("N39.0",   0.075),
+                    "conjunctivitis":  ("H10.9",   0.080),
+                    "red eye":         ("H10.9",   0.075),
+                    "skin infection":  ("L08.9",   0.075),
+                    "general illness": ("R68.89",  0.070),
+                    "weakness":        ("R53.1",   0.065),
+                    "allergy":         ("T78.40",  0.070),
+                }
+                for phrase, (target_code, boost) in _code_boost.items():
+                    if phrase in disease_lower and code == target_code:
+                        ctx += boost
+
+            scored.append((idx, ctx))
+
+        # Sort by adjusted score; tie-break by chapter frequency prior
+        chapter_prior = {"Non-Communicable": 3, "Symptom NOS": 2, "Communicable": 1, "Injury": 0}
+        scored.sort(key=lambda x: (x[1], chapter_prior.get(self._icd_anchors[x[0]][2], 0)),
+                    reverse=True)
+
+        best_idx, best_score = scored[0]
         code, desc, cat, subcat = self._icd_anchors[best_idx]
         return code, desc, cat, subcat, best_score
 
     def _llm_classify(self, clinical_text: str, extracted_disease: str) -> dict:
-        """Llama 3.3 70B fallback via OpenRouter for ambiguous cases."""
+        """GPT-4o-mini fallback via OpenAI for ambiguous cases."""
         if not self.api_key:
-            logger.warning("No OpenRouter API key — skipping LLM classification")
+            logger.warning("No OpenAI API key — skipping LLM classification")
             return {"icd10_code": "R69", "description": "Illness, unspecified",
                     "category": "Symptom NOS", "sub_category": "General", "confidence": 0.0}
         try:
             from openai import OpenAI
-            client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=self.api_key)
+            client = OpenAI(api_key=self.api_key)
 
             prompt = f"""You are a clinical coding expert. Classify the following patient presentation.
 
@@ -183,7 +311,7 @@ Return ONLY valid JSON with these fields:
 }}"""
 
             response = client.chat.completions.create(
-                model="meta-llama/llama-3.3-70b-instruct",
+                model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=300,
@@ -238,11 +366,14 @@ Return ONLY valid JSON with these fields:
                 bp_diastolic=entity.bp_dia,
                 spo2_pct=entity.spo2,
                 bmi_status=entity.bmi_status,
+                facility=entity.facility,
             )
 
         # Step 3: Embedding similarity via ClinicalBERT + FAISS
         try:
-            code, desc, cat, subcat, score = self._embedding_search(disease_norm or disease_raw)
+            code, desc, cat, subcat, score = self._embedding_search(
+                disease_norm or disease_raw, entity=entity
+            )
             if score >= CONFIDENCE_THRESHOLD_HIGH:
                 elapsed_ms = (time.time() - start) * 1000
                 return ClassificationOutput(
@@ -268,6 +399,7 @@ Return ONLY valid JSON with these fields:
                     bp_diastolic=entity.bp_dia,
                     spo2_pct=entity.spo2,
                     bmi_status=entity.bmi_status,
+                facility=entity.facility,
                 )
         except Exception as e:
             logger.warning(f"Embedding search failed: {e}")

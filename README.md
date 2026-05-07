@@ -91,7 +91,7 @@ Interactive docs: http://localhost:8000/docs
 ```bash
 # .env
 DATABASE_URL=postgresql://zeacares:password@localhost:5432/zeacares
-OPENROUTER_API_KEY=your_key_here          # For Llama 3.3 70B fallback
+OPENROUTER_API_KEY=your_key_here        
 REDIS_URL=redis://localhost:6379
 MODEL_CACHE_DIR=./model_cache
 LOG_LEVEL=INFO

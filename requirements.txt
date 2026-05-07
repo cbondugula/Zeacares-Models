@@ -29,12 +29,7 @@ pydantic>=2.7.0
 python-multipart>=0.0.9
 
 # Database
-psycopg2-binary>=2.9.9
-sqlalchemy>=2.0.29
-alembic>=1.13.0
-
-# Caching
-redis>=5.0.4
+pymongo[srv]>=4.7.0
 
 # LLM client
 openai>=1.30.0
