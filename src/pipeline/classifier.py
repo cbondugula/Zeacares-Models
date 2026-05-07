@@ -399,7 +399,7 @@ Return ONLY valid JSON with these fields:
                     bp_diastolic=entity.bp_dia,
                     spo2_pct=entity.spo2,
                     bmi_status=entity.bmi_status,
-                facility=entity.facility,
+                    facility=entity.facility,
                 )
         except Exception as e:
             logger.warning(f"Embedding search failed: {e}")
@@ -434,6 +434,7 @@ Return ONLY valid JSON with these fields:
             bp_diastolic=entity.bp_dia,
             spo2_pct=entity.spo2,
             bmi_status=entity.bmi_status,
+            facility=entity.facility,
         )
 
     def classify_batch(self, input_path: str, output_path: str = "results/classified.json",

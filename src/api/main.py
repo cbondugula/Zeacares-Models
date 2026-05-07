@@ -10,7 +10,14 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
+
+
+def _utcnow():
+    """Replacement for deprecated datetime.utcnow() — returns a naive UTC dt
+    matching the original behaviour (timezone stripped) so existing pandas /
+    Mongo serialisation paths still work."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 from pathlib import Path
 from typing import Optional
 
@@ -118,7 +125,7 @@ async def health_check():
         version="1.0.0",
         models_loaded=_classifier is not None and _classifier._initialized,
         database_connected=db_ok,
-        timestamp=datetime.utcnow().isoformat() + "Z",
+        timestamp=_utcnow().isoformat() + "Z",
     )
 
 
@@ -136,7 +143,7 @@ async def classify_single(request: ClassifyRequest):
             record_id=request.record_id or "api_call",
         )
         doc = asdict(result)
-        doc["created_at"] = datetime.utcnow()
+        doc["created_at"] = _utcnow()
         doc["source"] = "api"
         get_col("classifications").insert_one(doc)
         doc.pop("_id", None)
@@ -157,7 +164,7 @@ async def classify_batch(
     if not file.filename.endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=400, detail="Only .csv and .xlsx files accepted")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = _utcnow().strftime("%Y%m%d_%H%M%S")
     output_path = str(RESULTS_DIR / f"classified_{timestamp}.json")
     # Always overwrite classified.json so trend/dashboard endpoints find it
     canonical_path = str(RESULTS_DIR / "classified.json")
@@ -179,7 +186,7 @@ async def classify_batch(
                 docs = []
                 for r in results:
                     doc = asdict(r)
-                    doc["created_at"] = datetime.utcnow()
+                    doc["created_at"] = _utcnow()
                     doc["source"] = "batch"
                     doc["batch_file"] = file.filename
                     doc["batch_ts"] = timestamp
@@ -227,7 +234,7 @@ async def get_trends(
     df = pd.DataFrame(list(cursor))
 
     if "created_at" not in df.columns:
-        df["created_at"] = datetime.utcnow()
+        df["created_at"] = _utcnow()
     df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
 
     series = df.groupby("date").size().rename("case_count")
@@ -278,7 +285,7 @@ async def get_active_alerts():
         medium=severity_counts["MEDIUM"],
         low=severity_counts["LOW"],
         alerts=[AlertResponse(**a) for a in alerts],
-        generated_at=datetime.utcnow().isoformat() + "Z",
+        generated_at=_utcnow().isoformat() + "Z",
     )
 
 
@@ -301,7 +308,7 @@ async def refresh_alerts(background_tasks: BackgroundTasks):
                 if alerts:
                     get_col("alerts").delete_many({})
                     for a in alerts:
-                        a["refreshed_at"] = datetime.utcnow()
+                        a["refreshed_at"] = _utcnow()
                     get_col("alerts").insert_many(alerts)
                     logger.info(f"Stored {len(alerts)} alerts in MongoDB")
 
@@ -324,7 +331,7 @@ async def dashboard_summary():
         "created_at": 1, "disease_raw": 1, "disease_category": 1, "district": 1})
     df = pd.DataFrame(list(cursor))
 
-    now = datetime.utcnow()
+    now = _utcnow()
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"])
         records_7d  = int(df[df["created_at"] >= now - pd.Timedelta(days=7)].shape[0])
@@ -358,7 +365,7 @@ async def dashboard_summary():
 @app.post("/feedback", tags=["Improvement"])
 async def submit_feedback(request: FeedbackRequest):
     """Store ICD correction in MongoDB for model fine-tuning."""
-    doc = {**request.model_dump(), "submitted_at": datetime.utcnow()}
+    doc = {**request.model_dump(), "submitted_at": _utcnow()}
     get_col("feedback").insert_one(doc)
     total = get_col("feedback").count_documents({})
     return {
