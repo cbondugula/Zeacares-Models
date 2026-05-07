@@ -63,10 +63,14 @@ class ClinicalBERTClassifier:
     Optionally fine-tuned on ZeaCares annotated data for category classification.
     """
 
-    def __init__(self, device: Optional[str] = None, fine_tuned_path: Optional[str] = None):
+    def __init__(self, device: Optional[str] = None, fine_tuned_path: Optional[str] = None,
+                 cache_dir: Optional[str] = None):
         self.model_name = MODEL_NAME
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.fine_tuned_path = fine_tuned_path
+        # Resolve cache dir: explicit arg > TRANSFORMERS_CACHE env > default
+        import os as _os
+        self.cache_dir = cache_dir or _os.getenv("TRANSFORMERS_CACHE") or _os.getenv("HF_HOME")
         self.tokenizer = None
         self.model = None
         self._loaded = False
@@ -76,8 +80,8 @@ class ClinicalBERTClassifier:
             return
         load_path = self.fine_tuned_path or self.model_name
         logger.info(f"Loading ClinicalBERT from {load_path} on {self.device}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(load_path)
-        self.model = AutoModel.from_pretrained(load_path).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(load_path, cache_dir=self.cache_dir)
+        self.model = AutoModel.from_pretrained(load_path, cache_dir=self.cache_dir).to(self.device)
         self.model.eval()
         self._loaded = True
         logger.info("ClinicalBERT loaded successfully")

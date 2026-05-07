@@ -10,14 +10,7 @@ import os
 import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
-
-
-def _utcnow():
-    """Replacement for deprecated datetime.utcnow() — returns a naive UTC dt
-    matching the original behaviour (timezone stripped) so existing pandas /
-    Mongo serialisation paths still work."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -51,8 +44,10 @@ _trend_detector = None
 _mongo_client = None
 _db           = None
 
-RESULTS_DIR = Path("results")
-RESULTS_DIR.mkdir(exist_ok=True)
+# Anchor results dir to the project root regardless of where PM2/uvicorn is invoked from
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+RESULTS_DIR = Path(os.getenv("RESULTS_DIR", str(_PROJECT_ROOT / "results")))
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_col(name: str) -> Collection:
@@ -77,9 +72,17 @@ async def lifespan(app: FastAPI):
     logger.info("Loading ZeaCares classifier (ClinicalBERT)...")
     from src.pipeline.classifier import ZeaCaresClassifier
     from src.pipeline.trend_detector import TrendDetector
+    # Resolve model cache to an absolute path so HuggingFace caches in the project
+    _model_cache = os.getenv("MODEL_CACHE_DIR", str(_PROJECT_ROOT / "model_cache"))
+    os.environ.setdefault("TRANSFORMERS_CACHE", _model_cache)
+    os.environ.setdefault("HF_HOME", _model_cache)
+    os.environ.setdefault("SENTENCE_TRANSFORMERS_HOME", _model_cache)
+    Path(_model_cache).mkdir(parents=True, exist_ok=True)
+
     _classifier = ZeaCaresClassifier(
         openai_api_key=os.getenv("OPENAI_API_KEY"),
-        device=os.getenv("DEVICE"),
+        device=os.getenv("DEVICE", "cpu"),
+        model_cache_dir=_model_cache,
     )
     _classifier._init()   # pre-load model at startup — not per request
     _trend_detector = TrendDetector()
@@ -125,7 +128,7 @@ async def health_check():
         version="1.0.0",
         models_loaded=_classifier is not None and _classifier._initialized,
         database_connected=db_ok,
-        timestamp=_utcnow().isoformat() + "Z",
+        timestamp=datetime.utcnow().isoformat() + "Z",
     )
 
 
@@ -143,7 +146,7 @@ async def classify_single(request: ClassifyRequest):
             record_id=request.record_id or "api_call",
         )
         doc = asdict(result)
-        doc["created_at"] = _utcnow()
+        doc["created_at"] = datetime.utcnow()
         doc["source"] = "api"
         get_col("classifications").insert_one(doc)
         doc.pop("_id", None)
@@ -155,60 +158,82 @@ async def classify_single(request: ClassifyRequest):
 
 @app.post("/classify/batch", response_model=BatchClassificationResponse, tags=["Classification"])
 async def classify_batch(
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="CSV or XLSX file with clinicalText, district columns"),
 ):
-    """Process a batch file. Results stored in MongoDB + results/ folder."""
+    """Process a batch file synchronously. Returns real counts. Stores all results in MongoDB."""
     if not _classifier:
         raise HTTPException(status_code=503, detail="Classifier not initialized")
     if not file.filename.endswith((".csv", ".xlsx")):
         raise HTTPException(status_code=400, detail="Only .csv and .xlsx files accepted")
 
-    timestamp = _utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     output_path = str(RESULTS_DIR / f"classified_{timestamp}.json")
-    # Always overwrite classified.json so trend/dashboard endpoints find it
     canonical_path = str(RESULTS_DIR / "classified.json")
 
     suffix = ".xlsx" if file.filename.endswith(".xlsx") else ".csv"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
 
-    def _run_batch():
-        try:
-            results = _classifier.classify_batch(tmp_path, output_path)
-            # Also write canonical path for trend/dashboard
-            import shutil
-            shutil.copy(output_path, canonical_path)
-            # Store all results in MongoDB
-            if results:
-                docs = []
-                for r in results:
-                    doc = asdict(r)
-                    doc["created_at"] = _utcnow()
-                    doc["source"] = "batch"
-                    doc["batch_file"] = file.filename
-                    doc["batch_ts"] = timestamp
-                    docs.append(doc)
-                get_col("classifications").insert_many(docs)
-                logger.info(f"Stored {len(docs)} records in MongoDB zeacares.classifications")
-        except Exception as e:
-            logger.error(f"Batch failed: {e}")
-        finally:
+        # Run synchronously so we can return real counts
+        import asyncio
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            None, _classifier.classify_batch, tmp_path, output_path
+        )
+
+        if not results:
+            raise HTTPException(status_code=422, detail="No records could be parsed from the file")
+
+        # Write canonical path for trend/alert endpoints
+        import shutil
+        shutil.copy(output_path, canonical_path)
+
+        # Build stats
+        processed = sum(1 for r in results if r.icd10_code != "R69" or r.confidence > 0)
+        failed = len(results) - processed
+        sources: dict = {}
+        review_count = 0
+        total_ms = 0.0
+        docs = []
+        for r in results:
+            sources[r.classification_source] = sources.get(r.classification_source, 0) + 1
+            if r.review_required:
+                review_count += 1
+            total_ms += r.processing_time_ms
+            doc = asdict(r)
+            doc["created_at"] = datetime.utcnow()
+            doc["source"] = "batch"
+            doc["batch_file"] = file.filename
+            doc["batch_ts"] = timestamp
+            docs.append(doc)
+
+        # Store all in MongoDB
+        if docs:
+            get_col("classifications").insert_many(docs)
+            logger.info(f"Stored {len(docs)} records in MongoDB zeacares.classifications")
+
+        return BatchClassificationResponse(
+            total_records=len(results),
+            processed=processed,
+            failed=failed,
+            avg_processing_time_ms=round(total_ms / len(results), 2) if results else 0.0,
+            classification_sources=sources,
+            review_required_count=review_count,
+            results_path=output_path,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Batch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)
-
-    background_tasks.add_task(_run_batch)
-
-    return BatchClassificationResponse(
-        total_records=0,
-        processed=0,
-        failed=0,
-        avg_processing_time_ms=0.0,
-        classification_sources={},
-        review_required_count=0,
-        results_path=output_path,
-    )
 
 
 # ── Trends ─────────────────────────────────────────────────────────────────────
@@ -234,7 +259,7 @@ async def get_trends(
     df = pd.DataFrame(list(cursor))
 
     if "created_at" not in df.columns:
-        df["created_at"] = _utcnow()
+        df["created_at"] = datetime.utcnow()
     df["date"] = pd.to_datetime(df["created_at"]).dt.normalize()
 
     series = df.groupby("date").size().rename("case_count")
@@ -285,7 +310,7 @@ async def get_active_alerts():
         medium=severity_counts["MEDIUM"],
         low=severity_counts["LOW"],
         alerts=[AlertResponse(**a) for a in alerts],
-        generated_at=_utcnow().isoformat() + "Z",
+        generated_at=datetime.utcnow().isoformat() + "Z",
     )
 
 
@@ -308,7 +333,7 @@ async def refresh_alerts(background_tasks: BackgroundTasks):
                 if alerts:
                     get_col("alerts").delete_many({})
                     for a in alerts:
-                        a["refreshed_at"] = _utcnow()
+                        a["refreshed_at"] = datetime.utcnow()
                     get_col("alerts").insert_many(alerts)
                     logger.info(f"Stored {len(alerts)} alerts in MongoDB")
 
@@ -331,7 +356,7 @@ async def dashboard_summary():
         "created_at": 1, "disease_raw": 1, "disease_category": 1, "district": 1})
     df = pd.DataFrame(list(cursor))
 
-    now = _utcnow()
+    now = datetime.utcnow()
     if "created_at" in df.columns:
         df["created_at"] = pd.to_datetime(df["created_at"])
         records_7d  = int(df[df["created_at"] >= now - pd.Timedelta(days=7)].shape[0])
@@ -365,7 +390,7 @@ async def dashboard_summary():
 @app.post("/feedback", tags=["Improvement"])
 async def submit_feedback(request: FeedbackRequest):
     """Store ICD correction in MongoDB for model fine-tuning."""
-    doc = {**request.model_dump(), "submitted_at": _utcnow()}
+    doc = {**request.model_dump(), "submitted_at": datetime.utcnow()}
     get_col("feedback").insert_one(doc)
     total = get_col("feedback").count_documents({})
     return {

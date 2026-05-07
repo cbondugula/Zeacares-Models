@@ -8,20 +8,18 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # FIX: code reads OPENAI_API_KEY (see src/pipeline/classifier.py); the
-      # original compose passed OPENROUTER_API_KEY which the code ignored,
-      # so the LLM fallback always silently returned R69 "Illness, unspecified".
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      # FIX: code uses pymongo against MONGO_URI; original compose had
-      # PostgreSQL/Redis but no Mongo, so MongoClient timed out at boot.
-      - MONGO_URI=mongodb://zeacares-mongo:27017
+      - DATABASE_URL=postgresql://zeacares:zeacares_password@zeacares-postgres:5432/zeacares
+      - REDIS_URL=redis://zeacares-redis:6379
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - MODEL_CACHE_DIR=/app/model_cache
       - LOG_LEVEL=INFO
     volumes:
       - ./results:/app/results
       - model_cache:/app/model_cache
     depends_on:
-      zeacares-mongo:
+      zeacares-postgres:
+        condition: service_healthy
+      zeacares-redis:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -29,19 +27,23 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 8G
 
-  # ── MongoDB ───────────────────────────────────────────────────────────────────
-  # Required by src/api/main.py (pymongo). Was missing from the original compose.
-  zeacares-mongo:
-    image: mongo:7
-    container_name: zeacares-mongo
-    ports:
-      - "27017:27017"
+  # ── PostgreSQL Database ───────────────────────────────────────────────────────
+  zeacares-postgres:
+    image: postgis/postgis:16-3.4
+    container_name: zeacares-postgres
+    environment:
+      - POSTGRES_USER=zeacares
+      - POSTGRES_PASSWORD=zeacares_password
+      - POSTGRES_DB=zeacares
     volumes:
-      - mongo_data:/data/db
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
     healthcheck:
-      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      test: ["CMD-SHELL", "pg_isready -U zeacares -d zeacares"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -49,7 +51,24 @@ services:
     networks:
       - zeacares-net
 
-  # ── Background Worker (trend detection) ───────────────────────────────────────
+  # ── Redis Cache ───────────────────────────────────────────────────────────────
+  zeacares-redis:
+    image: redis:7-alpine
+    container_name: zeacares-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - zeacares-net
+
+  # ── Background Worker (batch processing + trend detection) ────────────────────
   zeacares-worker:
     build: .
     container_name: zeacares-worker
@@ -66,10 +85,11 @@ services:
           if classified.exists():
               logger.info('Running trend detection...')
               detector.run(str(classified), 'results/alerts.json')
-          time.sleep(3600)
+          time.sleep(3600)  # Re-run every hour
       "
     environment:
-      - MONGO_URI=mongodb://zeacares-mongo:27017
+      - DATABASE_URL=postgresql://zeacares:zeacares_password@zeacares-postgres:5432/zeacares
+      - REDIS_URL=redis://zeacares-redis:6379
     volumes:
       - ./results:/app/results
       - model_cache:/app/model_cache
@@ -80,7 +100,8 @@ services:
       - zeacares-net
 
 volumes:
-  mongo_data:
+  postgres_data:
+  redis_data:
   model_cache:
 
 networks:

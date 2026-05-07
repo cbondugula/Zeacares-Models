@@ -51,6 +51,7 @@ class ClassificationOutput:
     spo2_pct: Optional[float] = None
     bmi_status: Optional[str] = None
     facility: Optional[str] = None
+    extra_fields: Optional[dict] = None
 
 
 class ZeaCaresClassifier:
@@ -367,6 +368,7 @@ Return ONLY valid JSON with these fields:
                 spo2_pct=entity.spo2,
                 bmi_status=entity.bmi_status,
                 facility=entity.facility,
+                extra_fields=entity.extra_fields or {},
             )
 
         # Step 3: Embedding similarity via ClinicalBERT + FAISS
@@ -400,6 +402,7 @@ Return ONLY valid JSON with these fields:
                     spo2_pct=entity.spo2,
                     bmi_status=entity.bmi_status,
                     facility=entity.facility,
+                    extra_fields=entity.extra_fields or {},
                 )
         except Exception as e:
             logger.warning(f"Embedding search failed: {e}")
@@ -435,6 +438,7 @@ Return ONLY valid JSON with these fields:
             spo2_pct=entity.spo2,
             bmi_status=entity.bmi_status,
             facility=entity.facility,
+            extra_fields=entity.extra_fields or {},
         )
 
     def classify_batch(self, input_path: str, output_path: str = "results/classified.json",

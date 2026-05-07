@@ -3,7 +3,7 @@ Pydantic schemas for ZeaCares FastAPI endpoints.
 Defines request/response shapes for all API calls.
 """
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
 
 
@@ -61,6 +61,8 @@ class ClassificationResponse(BaseModel):
     spo2_pct: Optional[float]
     bmi_status: Optional[str]
     facility: Optional[str]
+    # Flexible extra fields — populated for any data not in the standard template
+    extra_fields: Optional[Dict[str, Any]] = None
 
 
 class BatchClassificationResponse(BaseModel):
@@ -68,7 +70,7 @@ class BatchClassificationResponse(BaseModel):
     processed: int
     failed: int
     avg_processing_time_ms: float
-    classification_sources: dict[str, int]
+    classification_sources: Dict[str, int]
     review_required_count: int
     results_path: str
 
